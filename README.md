@@ -66,6 +66,7 @@ npm run dev
 | 数据流转编排 | `flow` | 流转管道 | 管道编号、管道名称、起始节点 |
 | 数据血缘追踪 | `lineage` | 血缘关系 | 关系编号、上游节点、下游节点 |
 | 采集报告 | `report` | 采集报告 | 报告编号、采集源、统计周期 |
+| 采集载荷截断明细 | `truncation` | 截断明细/接入对账 | 声明条数、消息结束边界、断条页内位置、稳定运单键 |
 
 ## 约定
 
@@ -73,3 +74,38 @@ npm run dev
   `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 采集载荷截断明细与接入对账
+
+针对分页响应被截断（末行断在字段中间、页尾条目丢失）的采集-重试-对账链路，
+代码在 `backend/app/truncation/`，接口在 `backend/app/routers/truncation.py`：
+
+- **截断校验（`inspector.py`）**：用标准库 `json.JSONDecoder.raw_decode` 从被截断的
+  响应原文恢复完整前缀，校验三件事——声明条数、消息结束边界、已收到事件；输出断条的
+  页内位置与字符偏移、丢失位置、完整事件清单。
+- **总数漂移只告警**：服务端声明的 `total` 会因采集期间新增记录而变化，`total` 对不上
+  只记 `total_drift`，不会把边界完整的页判成错误页。
+- **重采关联（`reconcile.py`）**：截断页的完整前缀与重采数据按原页序+位置关联；
+  重发前缀（如重试时又送来的前 20 条）识别为重复、不二次交付；每个稳定键全局只占一条；
+  同位置键不一致（内容错位）显式留痕，越界写入被拒绝。
+- **两个业务视图**：装运侧随时可查“已可放行运单 / 等待页尾位置”（重试回来前也能查）；
+  结算侧按原页序与键值核齐整页。
+
+接口前缀 `/api/truncation`：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/channels/{code}/payloads` | 登记首次采集响应，回截断明细 |
+| POST | `/channels/{code}/retries` | 登记重试响应，回去重/补齐关联结果 |
+| GET | `/channels/{code}/releasable` | 装运放行查询（可放行运单 + 等待页尾位置） |
+| GET | `/channels/{code}/pages/{p}/reconcile` | 结算整页对账（原页序 + 键值） |
+| GET | `/channels/{code}/overview` | 通道各页接入进度汇总 |
+
+仅用标准库的测试与演示（无需安装依赖）：
+
+```bash
+cd backend
+python3 -I tests/test_truncation.py          # 截断恢复与重采对账单测
+python3 -I tests/test_truncation_service.py  # 服务层端到端时序
+python3 scripts/demo_truncation.py           # 题设场景演示（50 条/第 37 条断开/重试 52 条）
+```
